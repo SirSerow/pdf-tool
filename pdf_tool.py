@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -15,6 +18,23 @@ from pypdf.errors import PdfReadError
 
 
 APP_NAME = "PDF Tool"
+
+
+class _DuplicateInfoWarningFilter(logging.Filter):
+    """Hide pypdf's recoverable warning for duplicate trailer metadata."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not (
+            record.name == "pypdf.generic._data_structures"
+            and message.startswith("Multiple definitions in dictionary")
+            and message.endswith("for key /Info")
+        )
+
+
+logging.getLogger("pypdf.generic._data_structures").addFilter(
+    _DuplicateInfoWarningFilter()
+)
 
 
 def clean_path(value: str) -> Path:
@@ -227,6 +247,101 @@ def extract_pages(source: Path, selected_pages: Sequence[int], destination: Path
         write_pdf(writer, destination, overwrite=overwrite)
 
 
+def compress_pdf(source: Path, destination: Path, compression_level: int,
+                 *, overwrite: bool) -> tuple[int, int]:
+    """Downsample images and rewrite the PDF with Ghostscript."""
+    if source == destination:
+        raise ValueError("Choose a different output path; input files are never overwritten.")
+    if not 1 <= compression_level <= 9:
+        raise ValueError("Compression level must be between 1 and 9.")
+    original_size = source.stat().st_size
+    if destination.exists() and not overwrite:
+        raise FileExistsError(f"Output already exists: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    ghostscript = next(
+        (
+            executable
+            for name in ("gswin64c", "gswin32c", "gs")
+            if (executable := shutil.which(name))
+        ),
+        None,
+    )
+    if ghostscript is None:
+        raise OSError(
+            "Ghostscript is required for image compression. Install Ghostscript and "
+            "make gswin64c (Windows) or gs (macOS/Linux) available on your PATH."
+        )
+
+    # Higher levels trade image quality for a smaller file. PDF page instructions
+    # are normally tiny compared with the scanned/photo images they reference.
+    # Level 1 keeps near-print quality (300 dpi, Q90); level 9 targets screen
+    # viewing (75 dpi, Q40).
+    resolution = round(300 - (compression_level - 1) * 225 / 8)
+    jpeg_quality = round(90 - (compression_level - 1) * 50 / 8)
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".pdf", prefix=".pdf-tool-",
+            dir=destination.parent, delete=False
+        ) as temporary:
+            temporary_name = temporary.name
+        command = [
+            ghostscript,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dNOPAUSE",
+            "-dBATCH",
+            "-dQUIET",
+            "-dSAFER",
+            "-dDetectDuplicateImages=true",
+            "-dCompressFonts=true",
+            "-dSubsetFonts=true",
+            "-dDownsampleColorImages=true",
+            "-dColorImageDownsampleType=/Bicubic",
+            f"-dColorImageResolution={resolution}",
+            # Downsample every image above the target resolution. Ghostscript's
+            # default threshold of 1.5 skips most images, which made levels 1-8
+            # grow the file instead of shrinking it.
+            "-dColorImageDownsampleThreshold=1.0",
+            "-dDownsampleGrayImages=true",
+            "-dGrayImageDownsampleType=/Bicubic",
+            f"-dGrayImageResolution={resolution}",
+            "-dGrayImageDownsampleThreshold=1.0",
+            "-dDownsampleMonoImages=true",
+            "-dMonoImageDownsampleType=/Subsample",
+            f"-dMonoImageResolution={resolution}",
+            "-dMonoImageDownsampleThreshold=1.0",
+            # Keep JPEGs that need no resampling untouched instead of
+            # re-encoding them, which only inflates the output.
+            "-dPassThroughJPEGImages=true",
+            # Force JPEG for resampled images; AutoFilter sometimes picks
+            # Flate for noisy images, which balloons the output.
+            "-dAutoFilterColorImages=false",
+            "-dColorImageFilter=/DCTEncode",
+            "-dAutoFilterGrayImages=false",
+            "-dGrayImageFilter=/DCTEncode",
+            f"-dJPEGQ={jpeg_quality}",
+            f"-sOutputFile={temporary_name}",
+            str(source),
+        ]
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode:
+            details = completed.stderr.strip() or completed.stdout.strip()
+            raise OSError(f"Ghostscript compression failed: {details}")
+        os.replace(temporary_name, destination)
+        temporary_name = None
+    finally:
+        if temporary_name:
+            Path(temporary_name).unlink(missing_ok=True)
+    return original_size, destination.stat().st_size
+
+
 def collect_sources() -> list[Path]:
     print("Enter PDF paths in merge order. Press Enter on an empty line when done.")
     paths: list[Path] = []
@@ -344,6 +459,28 @@ def run_extract() -> None:
     print(f"Created {destination}")
 
 
+def run_compress() -> None:
+    source = choose_input()
+    print("Image compression downsamples and recompresses embedded images.")
+    print("Higher levels create smaller files with lower image quality.")
+    raw_level = input("Compression level (1 high quality - 9 smallest) [6]: ").strip()
+    level = 6 if not raw_level else int(raw_level)
+    destination = choose_output(source, "compressed")
+    overwrite = destination.exists() and confirm(f"Overwrite {destination}?")
+    if destination.exists() and not overwrite:
+        print("Cancelled.")
+        return
+    original_size, compressed_size = compress_pdf(
+        source, destination, level, overwrite=overwrite
+    )
+    difference = compressed_size - original_size
+    print(
+        f"Created {destination} "
+        f"({original_size / 1024:.1f} KiB -> {compressed_size / 1024:.1f} KiB, "
+        f"{difference / 1024:+.1f} KiB)"
+    )
+
+
 def run_info() -> None:
     source = choose_input()
     size = source.stat().st_size
@@ -370,6 +507,7 @@ MENU = {
     "4": ("Rotate pages", run_rotate),
     "5": ("Extract or reorder pages", run_extract),
     "6": ("Show PDF information", run_info),
+    "7": ("Compress a PDF", run_compress),
 }
 
 
